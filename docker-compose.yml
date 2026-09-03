@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cnpj_web
+    command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    environment:
+      - DB_PATH=/app/data/cnpj.db
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cnpj_net
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cnpj_rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - cnpj_net
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cnpj_producer
+    command: ["python", "main.py", "--mode", "producer", "--tables", "${TABLES:-all}", "--month", "${DEFAULT_MONTH:-latest}"]
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
+      - DB_PATH=/app/data/cnpj.db
+      - RECEITA_SHARE_URL=${RECEITA_SHARE_URL:-https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cnpj_net
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "main.py", "--mode", "worker"]
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
+      - DB_PATH=/app/data/cnpj.db
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cnpj_net
+    restart: on-failure
+
+volumes:
+  rabbitmq_data:
+    driver: local
+
+networks:
+  cnpj_net:
+    driver: bridge
