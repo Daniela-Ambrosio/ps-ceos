@@ -1,9 +1,11 @@
 """
 Orquestrador do Pipeline de Ingestão (cnpj_extractor.extraction.pipeline)
 ========================================================================
-Conecta e sincroniza o fluxo contínuo:
-WebDAV Client -> Arquivo Temporário (zipfile) -> Parser CSV -> SQLite DB.
-Trata falhas por arquivo de forma isolada e garante a integridade dos índices.
+Coordena o fluxo de extração e persistência para PostgreSQL:
+- Modo Direto: Download -> Temporary ZIP -> Parser -> Postgres UPSERT.
+- Modo Fila: Publicação no RabbitMQ para consumo por múltiplos workers concorrentes.
+- Criação Segura de Índices: Executada de forma independente, apenas após a confirmação
+  de 100% dos arquivos esperados do mês no banco de dados.
 """
 
 from dataclasses import dataclass, field
@@ -61,7 +63,7 @@ class IngestionPipeline:
         client: Optional[ReceitaFederalClient] = None,
     ):
         self.config = config or Config.carregar()
-        self.db = db or DatabaseManager(self.config.db_path)
+        self.db = db or DatabaseManager(self.config)
         self.client = client or ReceitaFederalClient(self.config)
 
     def executar(
@@ -73,6 +75,10 @@ class IngestionPipeline:
         pular_ja_processados: bool = True,
         criar_indices_ao_final: bool = True,
     ) -> EstatisticasProcessamento:
+        """
+        Execução sequencial/direta (para testes ou container individual)
+        gravando no PostgreSQL com isolamento de falhas por arquivo.
+        """
         stats = EstatisticasProcessamento()
         tempo_inicio = time.time()
 
@@ -90,20 +96,23 @@ class IngestionPipeline:
         if limite_linhas_por_arquivo:
             print(f"⚠️  Modo de teste: limite de {limite_linhas_por_arquivo} linhas por arquivo.")
 
-        # 2. Inicializa as tabelas no banco de dados SQLite
+        # 2. Inicializa as tabelas no PostgreSQL
         self.db.inicializar_tabelas(list(tabelas_alvo))
 
         # 3. Descobre a lista de arquivos remotos
         todos_arquivos = self.client.listar_arquivos(mes_alvo)
         arquivos_para_processar: List[ArquivoRemoto] = []
+        arquivos_esperados: List[str] = []
+
         for arq in todos_arquivos:
             tabela_correspondente = identificar_tabela_por_arquivo(arq.nome)
             if tabela_correspondente and tabela_correspondente in tabelas_alvo:
+                arquivos_esperados.append(arq.nome)
                 arquivos_para_processar.append(arq)
 
         print(f"📦 Total de arquivos selecionados: {len(arquivos_para_processar)}")
 
-        # 4. Itera e processa cada arquivo com isolamento de falhas
+        # 4. Itera e processa cada arquivo com isolamento de erros
         for idx, arquivo in enumerate(arquivos_para_processar, 1):
             tabela = identificar_tabela_por_arquivo(arquivo.nome)
             if not tabela:
@@ -124,7 +133,7 @@ class IngestionPipeline:
                     limite=limite_linhas_por_arquivo,
                 )
 
-                # Registra o arquivo como concluído apenas após streaming e inserção 100% finalizados
+                # Registra conclusão atômica no PostgreSQL
                 self.db.registrar_conclusao_arquivo(
                     nome_arquivo=arquivo.nome,
                     mes=mes_alvo,
@@ -142,20 +151,59 @@ class IngestionPipeline:
             except Exception as err:
                 logger.error(f"Falha ao processar arquivo '{arquivo.nome}': {err}")
                 print(f"\n  ❌ Erro ao processar '{arquivo.nome}': {err}")
-                print("  ⚠️  As inserções anteriores desta tabela utilizam chaves primárias e não serão duplicadas no reprocessamento.")
                 stats.arquivos_com_erro.append((arquivo.nome, str(err)))
 
-        # 5. Garantia e verificação inteligente dos índices no SQLite
+        # 5. Verificação explícita e autônoma de conclusão antes da criação de índices
         if criar_indices_ao_final:
-            indices_criados = self.db.verificar_e_garantir_indices(list(tabelas_alvo))
-            if indices_criados:
-                print(f"\n⚡ {len(indices_criados)} índice(s) criado(s) com sucesso no SQLite: {', '.join(indices_criados)}")
-            else:
-                print("\n⚡ Verificação de índices: todos os índices recomendados já estão presentes no SQLite.")
+            self.verificar_e_criar_indices(mes=mes_alvo, tabelas=list(tabelas_alvo), arquivos_esperados=arquivos_esperados)
 
         stats.tempo_total_segundos = time.time() - tempo_inicio
         self._exibir_relatorio_final(stats)
         return stats
+
+    def verificar_e_criar_indices(
+        self,
+        mes: Optional[str] = None,
+        tabelas: Optional[List[str]] = None,
+        arquivos_esperados: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Verifica se TODOS os arquivos esperados para o mês foram processados no banco.
+        Se concluído, cria/garante os índices no PostgreSQL.
+        Funciona mesmo se executado separadamente após os workers finalizarem.
+        """
+        mes_alvo = mes or self.config.default_month
+        if mes_alvo == "latest":
+            mes_alvo = self.client.obter_mes_mais_recente()
+
+        tabelas_alvo = resolver_tabelas_solicitadas(tabelas)
+
+        if arquivos_esperados is None:
+            todos_arquivos = self.client.listar_arquivos(mes_alvo)
+            arquivos_esperados = [
+                arq.nome for arq in todos_arquivos
+                if identificar_tabela_por_arquivo(arq.nome) in tabelas_alvo
+            ]
+
+        pendentes = self.db.verificar_arquivos_pendentes(mes_alvo, arquivos_esperados)
+
+        if pendentes:
+            print(f"\n⏳ {len(pendentes)} arquivo(s) ainda pendente(s) de processamento para {mes_alvo}:")
+            for p in pendentes[:5]:
+                print(f"   • {p}")
+            if len(pendentes) > 5:
+                print(f"   ... e outros {len(pendentes) - 5} arquivos.")
+            print("⚠️  A criação de índices foi postergada até a conclusão de 100% dos arquivos.")
+            return False
+
+        print(f"\n⚡ Todos os {len(arquivos_esperados)} arquivos esperados de {mes_alvo} foram confirmados no PostgreSQL!")
+        print("🔨 Criando e garantindo índices de alta performance no PostgreSQL...")
+        indices_criados = self.db.garantir_indices(list(tabelas_alvo))
+        if indices_criados:
+            print(f"✅ {len(indices_criados)} índice(s) criado(s) com sucesso: {', '.join(indices_criados)}")
+        else:
+            print("✅ Todos os índices recomendados já existem no PostgreSQL.")
+        return True
 
     def _processar_arquivo_stream(
         self,
@@ -170,7 +218,7 @@ class IngestionPipeline:
         print(f"  📥 Baixando {arquivo.nome} em blocos para disco temporário...")
         with self.client.abrir_stream_arquivo(arquivo) as raw_http_stream:
             with abrir_csv_do_zip_remoto(raw_http_stream, encoding="latin1") as text_stream:
-                print(f"  ⚙️  Extraindo e processando CSV ({tabela})...")
+                print(f"  ⚙️  Processando CSV e executando UPSERT no PostgreSQL ({tabela})...")
                 gerador_linhas = iterar_linhas_csv(
                     text_stream=text_stream,
                     tabela=tabela,
@@ -199,15 +247,10 @@ class IngestionPipeline:
         return linhas_inseridas
 
     def _exibir_relatorio_final(self, stats: EstatisticasProcessamento) -> None:
-        tamanho_db_mb = 0.0
-        if self.db.db_path.exists():
-            tamanho_db_mb = self.db.db_path.stat().st_size / (1024 * 1024)
-
         print("\n" + "=" * 60)
-        print("🎉 RELATÓRIO DE INGESTÃO")
+        print("🎉 RELATÓRIO DE INGESTÃO (POSTGRESQL)")
         print("=" * 60)
-        print(f"📁 Banco de Dados: {self.db.db_path}")
-        print(f"💾 Tamanho em disco: {tamanho_db_mb:.2f} MB")
+        print(f"📁 Banco de Dados: PostgreSQL ({self.config.postgres_host}:{self.config.postgres_port}/{self.config.postgres_db})")
         print(f"⏱️  Tempo Total: {stats.tempo_total_segundos:.1f} segundos")
         print(f"📄 Arquivos processados com sucesso: {stats.arquivos_processados}")
         print(f"⏭️  Arquivos ignorados (já existiam): {stats.arquivos_ignorados}")

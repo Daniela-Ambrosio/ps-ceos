@@ -11,7 +11,9 @@ from cnpj_extractor.config import Config
 from cnpj_extractor.queue.producer import TaskProducer
 from cnpj_extractor.queue.worker import TaskWorker
 
+
 class TestQueue(unittest.TestCase):
+
     @patch("cnpj_extractor.queue.producer.declarar_fila")
     @patch("cnpj_extractor.queue.producer.obter_conexao_rabbitmq")
     def test_producer(self, mock_conn, mock_decl):
@@ -24,10 +26,12 @@ class TestQueue(unittest.TestCase):
         mock_db = MagicMock()
         mock_db.arquivo_ja_processado.return_value = False
 
-        cfg = Config(rabbitmq_queue="test_q", db_path="data/test.db")
+        cfg = Config(rabbitmq_queue="test_q")
         producer = TaskProducer(config=cfg, client=mock_client, db=mock_db)
-        total = producer.publicar_tarefas(tabelas=["lookup"])
+        total, esperados = producer.publicar_tarefas(tabelas=["lookup"])
         self.assertEqual(total, 1)
+        self.assertEqual(esperados, ["Cnaes.zip"])
+
 
 if __name__ == "__main__":
     unittest.main()

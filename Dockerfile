@@ -17,10 +17,8 @@ RUN mkdir -p /app/data
 COPY cnpj_extractor/ /app/cnpj_extractor/
 COPY main.py .
 COPY app.py .
-COPY .env.example .
 
 VOLUME ["/app/data"]
 EXPOSE 8501
 
-ENTRYPOINT ["python", "main.py"]
 CMD ["--help"]

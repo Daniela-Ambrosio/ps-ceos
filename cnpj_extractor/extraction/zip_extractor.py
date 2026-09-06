@@ -99,3 +99,4 @@ def abrir_csv_do_zip_remoto(
                 os.remove(temp_path)
             except Exception as e:
                 logger.warning(f"Não foi possível remover o arquivo temporário '{temp_path}': {e}")
+

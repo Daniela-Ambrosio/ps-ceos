@@ -1,18 +1,21 @@
-version: "3.8"
-
 services:
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: cnpj_web
-    command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+  postgres:
+    image: postgres:16-alpine
+    container_name: cnpj_postgres
+    hostname: postgres
     ports:
-      - "8501:8501"
+      - "5432:5432"
     environment:
-      - DB_PATH=/app/data/cnpj.db
+      POSTGRES_DB: ${POSTGRES_DB:-cnpj_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-cnpj_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     volumes:
-      - ./data:/app/data
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - cnpj_net
     restart: unless-stopped
@@ -26,7 +29,7 @@ services:
       - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Defina RABBITMQ_PASSWORD no arquivo .env}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -36,6 +39,7 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
       - cnpj_net
+    restart: unless-stopped
 
   producer:
     build:
@@ -44,17 +48,21 @@ services:
     container_name: cnpj_producer
     command: ["python", "main.py", "--mode", "producer", "--tables", "${TABLES:-all}", "--month", "${DEFAULT_MONTH:-latest}"]
     environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-cnpj_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
-      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
-      - DB_PATH=/app/data/cnpj.db
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:?Defina RABBITMQ_PASSWORD no arquivo .env}
       - RECEITA_SHARE_URL=${RECEITA_SHARE_URL:-https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9}
     depends_on:
+      postgres:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    volumes:
-      - ./data:/app/data
     networks:
       - cnpj_net
 
@@ -64,21 +72,48 @@ services:
       dockerfile: Dockerfile
     command: ["python", "main.py", "--mode", "worker"]
     environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-cnpj_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
-      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
-      - DB_PATH=/app/data/cnpj.db
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:?Defina RABBITMQ_PASSWORD no arquivo .env}
     depends_on:
+      postgres:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    volumes:
-      - ./data:/app/data
     networks:
       - cnpj_net
     restart: on-failure
 
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cnpj_web
+    command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-cnpj_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - cnpj_net
+    restart: unless-stopped
+
 volumes:
+  postgres_data:
+    driver: local
   rabbitmq_data:
     driver: local
 

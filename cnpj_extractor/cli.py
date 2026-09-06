@@ -1,6 +1,8 @@
 """
 Interface de Linha de Comando (cnpj_extractor.cli)
 =================================================
+Permite executar a aplicação em modo standalone, produtor (RabbitMQ),
+worker concorrente ou efetuar consultas e verificação de índices no PostgreSQL.
 """
 
 import argparse
@@ -15,39 +17,66 @@ from .queue.worker import TaskWorker
 
 
 def criar_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cnpj-streamer", description="🚀 Coletor e Parser em Streaming de Dados de CNPJ")
-    parser.add_argument("--mode", type=str, choices=["standalone", "producer", "worker"], default="standalone")
-    parser.add_argument("--list-months", action="store_true")
-    parser.add_argument("--list-files", action="store_true")
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--search-cnpj", type=str)
-    parser.add_argument("--create-indexes", action="store_true")
-    parser.add_argument("--month", type=str, default=None)
-    parser.add_argument("--tables", type=str, default="all")
-    parser.add_argument("--uf", type=str, default=None)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--db-path", type=str, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--url", "--token", dest="url_ou_token", type=str, default=None)
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--no-index", action="store_true")
-    parser.add_argument("--rabbitmq-host", type=str, default=None)
-    parser.add_argument("--rabbitmq-port", type=int, default=None)
-    parser.add_argument("--rabbitmq-user", type=str, default=None)
-    parser.add_argument("--rabbitmq-password", type=str, default=None)
-    parser.add_argument("--rabbitmq-queue", type=str, default=None)
-    parser.add_argument("--max-tasks", type=int, default=None)
+    parser = argparse.ArgumentParser(
+        prog="cnpj-streamer",
+        description="🚀 Ingestão e Processamento Concorrente de CNPJ (PostgreSQL & RabbitMQ)",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["standalone", "producer", "worker"],
+        default="standalone",
+        help="Modo de operação: standalone (direto), producer (publica no RabbitMQ) ou worker (consome e grava no Postgres)",
+    )
+    parser.add_argument("--list-months", action="store_true", help="Lista os meses disponíveis na Receita Federal")
+    parser.add_argument("--list-files", action="store_true", help="Lista os arquivos remotos do mês selecionado")
+    parser.add_argument("--status", action="store_true", help="Exibe a contagem de registros por tabela no PostgreSQL")
+    parser.add_argument("--search-cnpj", type=str, help="Busca uma empresa completa pelo CNPJ no PostgreSQL")
+    parser.add_argument("--create-indexes", action="store_true", help="Garante a criação de índices no PostgreSQL")
+
+    # Parâmetros de extração
+    parser.add_argument("--month", type=str, default=None, help="Mês de referência (ex: 2026-08 ou latest)")
+    parser.add_argument("--tables", type=str, default="all", help="Tabelas ou grupos separados por vírgula (ex: empresas,estabelecimentos ou all)")
+    parser.add_argument("--uf", type=str, default=None, help="Filtro por UF para estabelecimentos (ex: SP, RJ)")
+    parser.add_argument("--limit", type=int, default=None, help="Limite de linhas por arquivo para testes rápidos")
+    parser.add_argument("--batch-size", type=int, default=None, help="Tamanho do lote para inserções no PostgreSQL")
+    parser.add_argument("--url", "--token", dest="url_ou_token", type=str, default=None, help="URL pública ou token da Receita")
+    parser.add_argument("--force", action="store_true", help="Força reprocessamento de arquivos já concluídos")
+    parser.add_argument("--no-index", action="store_true", help="Pula a etapa de verificação/criação de índices")
+
+    # Parâmetros do PostgreSQL
+    parser.add_argument("--pg-host", type=str, default=None, help="Host do PostgreSQL")
+    parser.add_argument("--pg-port", type=int, default=None, help="Porta do PostgreSQL")
+    parser.add_argument("--pg-db", type=str, default=None, help="Nome do banco de dados PostgreSQL")
+    parser.add_argument("--pg-user", type=str, default=None, help="Usuário do PostgreSQL")
+    parser.add_argument("--pg-password", type=str, default=None, help="Senha do PostgreSQL")
+    parser.add_argument("--database-url", type=str, default=None, help="URL de conexão PostgreSQL (ex: postgresql://user:pass@host:5432/db)")
+
+    # Parâmetros do RabbitMQ
+    parser.add_argument("--rabbitmq-host", type=str, default=None, help="Host do RabbitMQ")
+    parser.add_argument("--rabbitmq-port", type=int, default=None, help="Porta do RabbitMQ")
+    parser.add_argument("--rabbitmq-user", type=str, default=None, help="Usuário do RabbitMQ")
+    parser.add_argument("--rabbitmq-password", type=str, default=None, help="Senha do RabbitMQ")
+    parser.add_argument("--rabbitmq-queue", type=str, default=None, help="Nome da fila no RabbitMQ")
+    parser.add_argument("--max-tasks", type=int, default=None, help="Máximo de tarefas para o worker processar antes de encerrar")
+
     return parser
 
 
 def executar_cli(args_lista: Optional[List[str]] = None) -> int:
     parser = criar_argument_parser()
     args = parser.parse_args(args_lista)
+
     config = Config.carregar(
         url_ou_token=args.url_ou_token,
-        db_path=args.db_path,
         batch_size=args.batch_size,
         month=args.month,
+        postgres_host=args.pg_host,
+        postgres_port=args.pg_port,
+        postgres_db=args.pg_db,
+        postgres_user=args.pg_user,
+        postgres_password=args.pg_password,
+        database_url=args.database_url,
         rabbitmq_host=args.rabbitmq_host,
         rabbitmq_port=args.rabbitmq_port,
         rabbitmq_user=args.rabbitmq_user,
@@ -71,16 +100,19 @@ def executar_cli(args_lista: Optional[List[str]] = None) -> int:
         return 0
 
     if args.status:
-        db = DatabaseManager(config.db_path)
-        for tab in ["cnaes", "motivos", "municipios", "naturezas_juridicas", "paises", "qualificacoes_socios", "empresas", "estabelecimentos", "socios", "simples"]:
+        db = DatabaseManager(config)
+        for tab in [
+            "cnaes", "motivos", "municipios", "naturezas_juridicas", "paises",
+            "qualificacoes_socios", "empresas", "estabelecimentos", "socios", "simples",
+        ]:
             try:
                 print(f"  • {tab.ljust(25)}: {db.contar_linhas(tab):,} registros")
             except Exception:
-                print(f"  • {tab.ljust(25)}: (não criada)")
+                print(f"  • {tab.ljust(25)}: (não criada ou inacessível)")
         return 0
 
     if args.search_cnpj:
-        db = DatabaseManager(config.db_path)
+        db = DatabaseManager(config)
         empresa = db.buscar_empresa_detalhada(args.search_cnpj)
         if not empresa:
             print(f"❌ Nenhuma empresa encontrada com CNPJ '{args.search_cnpj}'.")
@@ -89,17 +121,22 @@ def executar_cli(args_lista: Optional[List[str]] = None) -> int:
             print(f"  {k}: {empresa.get(k)}")
         return 0
 
+    tabelas_lista = [t.strip() for t in args.tables.split(",") if t.strip()]
+
     if args.create_indexes:
-        db = DatabaseManager(config.db_path)
-        print("⚡ Criando índices no banco de dados...")
-        db.criar_indices()
-        print("✅ Índices criados com sucesso!")
+        pipeline = IngestionPipeline(config=config)
+        pipeline.verificar_e_criar_indices(mes=args.month, tabelas=tabelas_lista)
         return 0
 
     if args.mode == "producer":
-        tabelas_lista = [t.strip() for t in args.tables.split(",") if t.strip()]
         producer = TaskProducer(config=config)
-        producer.publicar_tarefas(mes=args.month, tabelas=tabelas_lista, filtro_uf=args.uf, limite_linhas=args.limit, pular_ja_processados=not args.force)
+        producer.publicar_tarefas(
+            mes=args.month,
+            tabelas=tabelas_lista,
+            filtro_uf=args.uf,
+            limite_linhas=args.limit,
+            pular_ja_processados=not args.force,
+        )
         return 0
 
     if args.mode == "worker":
@@ -107,7 +144,14 @@ def executar_cli(args_lista: Optional[List[str]] = None) -> int:
         worker.iniciar_consumo(max_tarefas=args.max_tasks)
         return 0
 
-    tabelas_lista = [t.strip() for t in args.tables.split(",") if t.strip()]
+    # Modo standalone (execução direta)
     pipeline = IngestionPipeline(config=config)
-    pipeline.executar(mes=args.month, tabelas=tabelas_lista, filtro_uf=args.uf, limite_linhas_por_arquivo=args.limit, pular_ja_processados=not args.force, criar_indices_ao_final=not args.no_index)
+    pipeline.executar(
+        mes=args.month,
+        tabelas=tabelas_lista,
+        filtro_uf=args.uf,
+        limite_linhas_por_arquivo=args.limit,
+        pular_ja_processados=not args.force,
+        criar_indices_ao_final=not args.no_index,
+    )
     return 0
