@@ -5,6 +5,7 @@ Docker e Docker Compose (plugin docker compose)
 
 --- 
 ## Arquitetura
+```bash
 ┌─────────────┐      ┌──────────────┐      ┌─────────────┐
 │  producer   │──1──▶│   RabbitMQ   │──2──▶│   worker(s) │──3──▶ PostgreSQL
 │ (descobre e │      │ (fila com    │      │ (baixa, faz │        ▲
@@ -17,7 +18,7 @@ Docker e Docker Compose (plugin docker compose)
 │  pela fila
 └─────────────────────────────────────────────────────────────────
 
-
+```
 ---
 ## Para executar
 ```bash 
